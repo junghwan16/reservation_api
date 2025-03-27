@@ -7,13 +7,6 @@ from .models import Slot
 
 
 class SlotSerializer(serializers.ModelSerializer):
-    remaining_capacity = serializers.SerializerMethodField(
-        help_text="슬롯의 남은 수용 인원"
-    )
-    max_capacity = serializers.SerializerMethodField(
-        help_text="슬롯의 최대 수용 인원"
-    )
-
     class Meta:
         model = Slot
         fields = [
@@ -21,16 +14,4 @@ class SlotSerializer(serializers.ModelSerializer):
             "slot_start_time",
             "slot_end_time",
             "capacity_used",
-            "remaining_capacity",
-            "max_capacity",
         ]
-
-    @extend_schema_field(serializers.IntegerField)
-    def get_remaining_capacity(self, obj: Slot) -> int:
-        """슬롯의 남은 수용 인원을 계산합니다."""
-        return obj.remaining_capacity()
-
-    @extend_schema_field(serializers.IntegerField)
-    def get_max_capacity(self, obj: Slot) -> int:
-        """슬롯의 최대 수용 인원을 반환합니다."""
-        return Slot.MAX_CAPACITY

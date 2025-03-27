@@ -1,12 +1,9 @@
 from django.db import transaction
 from django.db.models import F
-from django.shortcuts import get_object_or_404
-from django.utils import timezone
-from drf_spectacular.utils import OpenApiExample, OpenApiParameter, extend_schema, extend_schema_view
 from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
-from rest_framework.exceptions import ValidationError, PermissionDenied
 
 from slots.models import Slot
 
@@ -27,7 +24,7 @@ class IsAdminOrOwnReservation(permissions.BasePermission):
             return False
 
         # 예약 목록 조회 및 생성은 인증된 사용자 모두 가능
-        if view.action in ['list', 'create']:
+        if view.action in ["list", "create"]:
             return True
 
         return True  # 다른 액션은 has_object_permission에서 확인
@@ -38,9 +35,9 @@ class IsAdminOrOwnReservation(permissions.BasePermission):
             return True
 
         # 예약 확정(confirm)은 관리자만 가능
-        if view.action == 'confirm':
+        if view.action == "confirm":
             return False
-            
+
         # 소유자 확인
         return obj.user and obj.user == request.user
 
@@ -48,13 +45,13 @@ class IsAdminOrOwnReservation(permissions.BasePermission):
 class ReservationViewSet(viewsets.ModelViewSet):
     """
     예약 관리를 위한 API 뷰셋입니다.
-    
+
     예약 시스템은 다음과 같은 규칙을 따릅니다:
     1. 예약은 슬롯 시작 시간으로부터 최소 72시간 전에 이루어져야 합니다.
     2. 예약은 처음에 PENDING 상태로 생성되고, 관리자가 확인 후 CONFIRMED 상태로 변경됩니다.
     3. CONFIRMED 상태의 예약은 수정할 수 없습니다.
     4. 최대 수용 인원(Slot.MAX_CAPACITY)을 초과하는 예약은 확정할 수 없습니다.
-    
+
     사용 가능한 엔드포인트:
     - GET /api/reservations/ - 예약 목록 조회 (관리자: 모든 예약, 일반 사용자: 자신의 예약)
     - POST /api/reservations/ - 새 예약 생성
@@ -74,11 +71,11 @@ class ReservationViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         """사용자별 예약 필터링"""
         queryset = super().get_queryset()
-        
+
         # 관리자가 아닌 경우 자신의 예약만 볼 수 있음
         if not self.request.user.is_staff:
             queryset = queryset.filter(user=self.request.user)
-            
+
         return queryset
 
     def perform_create(self, serializer):
@@ -89,60 +86,85 @@ class ReservationViewSet(viewsets.ModelViewSet):
     def create(self, request, *args, **kwargs):
         """
         새 예약을 생성합니다.
-        
+
         트랜잭션을 사용하여 일관성을 보장하고, 시리얼라이저를 통해 유효성을 검증합니다.
         현재 인증된 사용자가 자동으로 예약의 소유자로 설정됩니다.
         """
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        
+
         # perform_create에서 현재 사용자를 예약 소유자로 설정
         self.perform_create(serializer)
-        
+
         headers = self.get_success_headers(serializer.data)
         return Response(
-            serializer.data, 
-            status=status.HTTP_201_CREATED, 
-            headers=headers
+            serializer.data, status=status.HTTP_201_CREATED, headers=headers
         )
 
     @transaction.atomic
     def update(self, request, *args, **kwargs):
         """
         예약을 수정합니다.
-        
-        트랜잭션을 사용하여 일관성을 보장하고, PENDING 상태가 아닌 예약은 수정할 수 없습니다.
+
+        관리자는 모든 상태의 예약을 수정할 수 있으며, 일반 사용자는 PENDING 상태의 예약만 수정할 수 있습니다.
+        트랜잭션을 사용하여 일관성을 보장합니다.
         """
-        partial = kwargs.pop('partial', False)
+        partial = kwargs.pop("partial", False)
         instance = self.get_object()
-        
+
+        # 관리자가 아닌 경우 PENDING 상태 확인
+        if not request.user.is_staff and instance.status != Reservation.STATUS_PENDING:
+            raise PermissionDenied("PENDING 상태의 예약만 수정할 수 있습니다.")
+
         # 시리얼라이저에서 상태 검증을 수행
-        serializer = self.get_serializer(
-            instance, 
-            data=request.data, 
-            partial=partial
-        )
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
         serializer.is_valid(raise_exception=True)
-        
-        self.perform_update(serializer)
+
+        # 기존 예약 상태와 슬롯 정보 저장
+        old_status = instance.status
+        old_slot_ids = instance.get_slot_ids()
+
+        try:
+            # 기존 예약이 CONFIRMED 상태였다면 슬롯 용량 복구
+            if old_status == Reservation.STATUS_CONFIRMED:
+                slots = Slot.objects.filter(id__in=old_slot_ids).select_for_update()
+                for slot in slots:
+                    slot.capacity_used = F("capacity_used") - instance.total_attendees
+                    slot.save()
+
+            # 예약 업데이트
+            self.perform_update(serializer)
+
+            # 새로운 예약이 CONFIRMED 상태라면 슬롯 용량 감소
+            if serializer.instance.status == Reservation.STATUS_CONFIRMED:
+                new_slot_ids = serializer.instance.get_slot_ids()
+                slots = Slot.objects.filter(id__in=new_slot_ids).select_for_update()
+                
+                for slot in slots:
+                    if slot.capacity_used + serializer.instance.total_attendees > Slot.MAX_CAPACITY:
+                        raise ValidationError(
+                            f"슬롯 {slot.id}의 수용 인원을 초과했습니다. "
+                            f"현재 사용: {slot.capacity_used}, 요청: {serializer.instance.total_attendees}, "
+                            f"최대: {Slot.MAX_CAPACITY}"
+                        )
+                    slot.capacity_used = F("capacity_used") + serializer.instance.total_attendees
+                    slot.save()
+
+        except Exception as e:
+            # 트랜잭션 롤백은 자동으로 처리됨
+            raise ValidationError({"error": f"예약 수정 중 오류가 발생했습니다: {str(e)}"})
 
         return Response(
             {"message": "예약이 성공적으로 수정되었습니다", "data": serializer.data},
-            status=status.HTTP_200_OK
+            status=status.HTTP_200_OK,
         )
 
     @action(detail=True, methods=["post"])
-    @extend_schema(
-        summary="예약 확정",
-        description="예약을 확정합니다. 관리자만 이 작업을 수행할 수 있습니다. 슬롯의 용량을 확인하고 예약을 확정합니다.",
-        tags=["예약"],
-        request=None,
-    )
     @transaction.atomic
     def confirm(self, request, pk=None):
         """
         예약을 확정합니다.
-        
+
         이 작업은 관리자만 수행할 수 있으며, 슬롯의 용량을 확인한 후 예약을 확정합니다.
         트랜잭션과 비관적 락(SELECT FOR UPDATE)을 사용하여 동시성 문제를 방지합니다.
         """
@@ -155,7 +177,7 @@ class ReservationViewSet(viewsets.ModelViewSet):
 
         # 수용 인원 초과 여부 확인 및 슬롯 업데이트
         slot_ids = reservation.get_slot_ids()
-        
+
         # 비관적 락으로 슬롯 조회
         slots = Slot.objects.filter(id__in=slot_ids).select_for_update()
 
@@ -181,7 +203,9 @@ class ReservationViewSet(viewsets.ModelViewSet):
             reservation.save()
         except Exception as e:
             # 롤백은 트랜잭션 데코레이터에 의해 자동으로 처리됨
-            raise ValidationError({"error": f"예약 확정 중 오류가 발생했습니다: {str(e)}"})
+            raise ValidationError(
+                {"error": f"예약 확정 중 오류가 발생했습니다: {str(e)}"}
+            )
 
         return Response(
             {
@@ -195,7 +219,7 @@ class ReservationViewSet(viewsets.ModelViewSet):
     def destroy(self, request, *args, **kwargs):
         """
         예약을 삭제합니다.
-        
+
         CONFIRMED 상태인 경우 슬롯의 capacity_used를 감소시킵니다.
         트랜잭션과 비관적 락을 사용하여 일관성을 유지합니다.
         """
@@ -204,7 +228,7 @@ class ReservationViewSet(viewsets.ModelViewSet):
         # CONFIRMED 상태인 경우, 슬롯 capacity_used 감소
         if reservation.status == Reservation.STATUS_CONFIRMED:
             slot_ids = reservation.get_slot_ids()
-            
+
             # 비관적 락으로 슬롯 조회
             slots = Slot.objects.filter(id__in=slot_ids).select_for_update()
 

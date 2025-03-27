@@ -244,8 +244,8 @@ class ReservationAPITest(TestCase):
             content_type="application/json",
         )
 
-        # 확정된 예약은 수정 불가능하므로 400 Bad Request 예상
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        # 확정된 예약은 수정 불가능하므로 403 Forbidden 예상
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
     def test_confirm_reservation(self):
         """예약 확정 테스트 (관리자)"""
@@ -461,6 +461,103 @@ class ReservationAPITest(TestCase):
 
         # 총 5개의 예약이 있어야 함
         self.assertEqual(len(data["results"]), 5)
+
+    def test_admin_update_confirmed_reservation(self):
+        """관리자가 CONFIRMED 상태의 예약을 수정할 수 있는지 테스트"""
+        # 관리자로 인증
+        self.authenticate_as_admin()
+
+        # CONFIRMED 상태의 예약 생성
+        reservation = Reservation.objects.create(
+            user=self.user, total_attendees=1000, status="CONFIRMED"
+        )
+
+        # 슬롯 연결 및 용량 설정
+        slot = self.slots[0]
+        slot.capacity_used = 1000
+        slot.save()
+        ReservationSlot.objects.create(reservation=reservation, slot=slot)
+
+        # 수정 데이터 (참가자 수와 슬롯 변경)
+        update_data = {
+            "total_attendees": 2000,
+            "slot_ids": [self.slots[1].id],  # 다른 슬롯으로 변경
+        }
+
+        # 수정 요청
+        update_url = reverse("reservation-detail", args=[reservation.id])
+        response = self.client.patch(
+            update_url,
+            data=json.dumps(update_data),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # 변경 사항 확인
+        reservation.refresh_from_db()
+        self.assertEqual(reservation.total_attendees, 2000)
+        self.assertEqual(reservation.slots.count(), 1)
+        self.assertTrue(reservation.slots.filter(id=self.slots[1].id).exists())
+
+        # 기존 슬롯의 용량이 복구되었는지 확인
+        slot.refresh_from_db()
+        self.assertEqual(slot.capacity_used, 0)
+
+        # 새로운 슬롯의 용량이 감소되었는지 확인
+        new_slot = self.slots[1]
+        new_slot.refresh_from_db()
+        self.assertEqual(new_slot.capacity_used, 2000)
+
+    def test_admin_update_confirmed_reservation_capacity_exceed(self):
+        """관리자가 CONFIRMED 상태의 예약을 수정할 때 용량 초과 테스트"""
+        # 관리자로 인증
+        self.authenticate_as_admin()
+
+        # CONFIRMED 상태의 예약 생성
+        reservation = Reservation.objects.create(
+            user=self.user, total_attendees=1000, status="CONFIRMED"
+        )
+
+        # 슬롯 연결 및 용량 설정
+        slot = self.slots[0]
+        slot.capacity_used = 1000
+        slot.save()
+        ReservationSlot.objects.create(reservation=reservation, slot=slot)
+
+        # 다른 슬롯의 용량을 거의 다 채우기
+        target_slot = self.slots[1]
+        target_slot.capacity_used = 45000  # 5,000명만 남김
+        target_slot.save()
+
+        # 수정 데이터 (참가자 수를 10,000명으로 증가)
+        update_data = {
+            "total_attendees": 10000,
+            "slot_ids": [target_slot.id],
+        }
+
+        # 수정 요청
+        update_url = reverse("reservation-detail", args=[reservation.id])
+        response = self.client.patch(
+            update_url,
+            data=json.dumps(update_data),
+            content_type="application/json",
+        )
+
+        # 용량 초과로 400 Bad Request 예상
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # 예약이 변경되지 않았는지 확인
+        reservation.refresh_from_db()
+        self.assertEqual(reservation.total_attendees, 1000)
+        self.assertEqual(reservation.slots.count(), 1)
+        self.assertTrue(reservation.slots.filter(id=slot.id).exists())
+
+        # 슬롯 용량이 변경되지 않았는지 확인
+        slot.refresh_from_db()
+        self.assertEqual(slot.capacity_used, 1000)
+        target_slot.refresh_from_db()
+        self.assertEqual(target_slot.capacity_used, 45000)
 
 
 class ReservationConcurrencyTest(TransactionTestCase):
