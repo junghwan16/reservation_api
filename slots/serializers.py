@@ -7,8 +7,12 @@ from .models import Slot
 
 
 class SlotSerializer(serializers.ModelSerializer):
-    remaining_capacity = serializers.SerializerMethodField()
-    max_capacity = serializers.SerializerMethodField()
+    remaining_capacity = serializers.SerializerMethodField(
+        help_text="슬롯의 남은 수용 인원"
+    )
+    max_capacity = serializers.SerializerMethodField(
+        help_text="슬롯의 최대 수용 인원"
+    )
 
     class Meta:
         model = Slot
